@@ -532,9 +532,56 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let started = boot_read_trace_enabled().then(std::time::Instant::now);
+    let result = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    if let Some(started) = started {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: preserve the last-error value returned by the real read.
+        let error = unsafe { GetLastError() };
+        log_boot_read("ReadFile", file, len as usize, started, result != 0, error);
+        unsafe { SetLastError(error) };
+    }
+    result
+}
+
+pub(super) fn boot_read_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_TRACE_BOOT_READS").as_deref() == Some("1".as_ref())
+    })
+}
+
+pub(super) fn log_boot_read(
+    api: &str,
+    file: Handle,
+    requested: usize,
+    started: std::time::Instant,
+    ok: bool,
+    error: u32,
+) {
+    let elapsed = started.elapsed();
+    if elapsed < std::time::Duration::from_millis(2) {
+        return;
+    }
+    use windows_sys::Win32::Storage::FileSystem::{FILE_NAME_OPENED, GetFinalPathNameByHandleW};
+    let mut path = [0u16; 1024];
+    // SAFETY: path is writable and the caller still owns the file handle.
+    let n = unsafe {
+        GetFinalPathNameByHandleW(file, path.as_mut_ptr(), path.len() as u32, FILE_NAME_OPENED)
+    };
+    let path = if n != 0 && (n as usize) < path.len() {
+        String::from_utf16_lossy(&path[..n as usize])
+    } else {
+        String::from("<unresolved>")
+    };
+    tracing::info!(
+        api, path, requested, ok,
+        error = if ok { 0 } else { error },
+        us = elapsed.as_micros() as u64,
+        "boot file read"
+    );
 }
 
 /// The host CRT reads large requests straight into the caller's buffer

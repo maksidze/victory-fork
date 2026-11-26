@@ -1107,6 +1107,17 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if super::files::boot_read_trace_enabled() {
+        use std::os::windows::io::AsRawHandle;
+        super::files::log_boot_read(
+            "DirectStorage",
+            file.as_raw_handle(),
+            out.len(),
+            started,
+            result.is_ok(),
+            result.err().unwrap_or(0) as u32,
+        );
+    }
     result
 }
 
