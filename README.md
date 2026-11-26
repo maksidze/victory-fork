@@ -726,10 +726,12 @@ cargo run -p victory -- config           # check your paths
 Run the title:
 
 ```powershell
+cargo xtask agility  # On Windows 10, install the app-local D3D12 runtime for shader model 6.6.
 cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+Set `VICTORY_WINDOW=1280x720` to request a 1280×720 client area.
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.

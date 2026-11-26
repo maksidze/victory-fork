@@ -73,7 +73,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, x, y, width, height, style, ex_style, menu);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -99,7 +99,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, x, y, width, height, style, ex_style, menu);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -115,13 +115,44 @@ pub extern "system" fn CreateWindowExA(
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+fn fit(
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    style: u32,
+    ex_style: u32,
+    menu: HMENU,
+) -> (i32, i32, i32, i32) {
+    if !parent.is_null() {
+        return (x, y, width, height);
+    }
+    let requested = std::env::var("VICTORY_WINDOW").ok().and_then(|size| {
+        let (w, h) = size.split_once('x')?;
+        let (w, h) = (w.parse::<i32>().ok()?, h.parse::<i32>().ok()?);
+        if !(1..=32767).contains(&w) || !(1..=32767).contains(&h) {
+            return None;
+        }
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        // SAFETY: rect receives the outer dimensions for the supplied client size.
+        let known = unsafe {
+            wm::AdjustWindowRectEx(&raw mut rect, style, i32::from(!menu.is_null()), ex_style)
+        };
+        (known != 0).then_some((rect.right - rect.left, rect.bottom - rect.top))
+    });
+    let (width, height) = requested.unwrap_or((width, height));
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
     let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
+    if known == 0 || (requested.is_none() && fitted == (width, height)) {
         return (x, y, width, height);
     }
     tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
