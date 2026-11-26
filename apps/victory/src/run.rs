@@ -106,6 +106,7 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    preload_archives(title_dir);
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
@@ -183,6 +184,81 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+#[cfg(windows)]
+fn preload_archives(title_dir: &Path) {
+    use std::path::Component;
+    use std::time::Instant;
+
+    let Some(list) = std::env::var_os("VICTORY_PRELOAD") else {
+        return;
+    };
+    let Some(list) = list.to_str() else {
+        eprintln!("preload: VICTORY_PRELOAD is not valid Unicode");
+        return;
+    };
+    let mut entries = list
+        .split(';')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .peekable();
+    if entries.peek().is_none() {
+        return;
+    }
+
+    let start = Instant::now();
+    let mut total_bytes = 0;
+    for name in entries {
+        let path = Path::new(name);
+        if !path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+        {
+            eprintln!("preload: skipped {name:?}, expected a path relative to the title");
+            continue;
+        }
+        let path = title_dir.join(path);
+        let start = Instant::now();
+        match preload_file(&path) {
+            Ok(bytes) => {
+                total_bytes += bytes;
+                println!(
+                    "preload: read {} ({bytes} bytes, {} ms)",
+                    path.display(),
+                    start.elapsed().as_millis()
+                );
+            }
+            Err(error) => eprintln!("preload: skipped {} ({error})", path.display()),
+        }
+    }
+    println!(
+        "preload: finished ({total_bytes} bytes, {} ms)",
+        start.elapsed().as_millis()
+    );
+}
+
+#[cfg(windows)]
+fn preload_file(path: &Path) -> std::io::Result<u64> {
+    use std::io::{self, BufRead, BufReader};
+
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a file",
+        ));
+    }
+    let mut file = BufReader::with_capacity(1024 * 1024, file);
+    let mut bytes = 0;
+    loop {
+        let count = file.fill_buf()?.len();
+        if count == 0 {
+            return Ok(bytes);
+        }
+        file.consume(count);
+        bytes += count as u64;
+    }
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.

@@ -736,6 +736,18 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
+On a hard drive, set `VICTORY_PRELOAD` before launching to read selected
+archives into the Windows file cache before the title starts:
+
+```powershell
+$env:VICTORY_PRELOAD = 'shaders.rpf;data.rpf'
+```
+
+Separate paths with semicolons and resolve them relative to the title executable's
+directory. The log reports how many bytes were read and how long the preload
+took. Windows can reclaim this cached memory when needed.
+Remove the environment variable to disable preloading.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
