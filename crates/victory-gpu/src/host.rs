@@ -1572,6 +1572,11 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
+    /// The window of indirect draws clamped together (`crate::indirect::clamp_window`), if one is open.
+    clamp_window: Mutex<Option<crate::indirect::Window>>,
+    /// Occlusion queries begun on the host in this list and not ended in it (`crate::query`, `VICTORY_OCCLUSION`):
+    /// host heap, console kind, index, console heap.
+    open_queries: Mutex<Vec<(ID3D12QueryHeap, u32, u32, usize)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -5082,6 +5087,8 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
+                clamp_window: Mutex::new(None),
+                open_queries: Mutex::new(Vec::new()),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
@@ -7427,6 +7434,13 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The copies below write buffers on the card: no draw after them joins a window.
+        crate::indirect::end_window(self);
+        // Host queries begun in this list and never ended here: ended now, answered "visible".
+        let open = std::mem::take(&mut *self.open_queries.lock().unwrap_or_else(|e| e.into_inner()));
+        if !open.is_empty() {
+            crate::query::close_open(open, self);
+        }
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -7477,6 +7491,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8284,6 +8299,21 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
+    /// The list's window of indirect draws clamped together (`crate::indirect::windowed`).
+    pub(crate) fn clamp_window(&self) -> std::sync::MutexGuard<'_, Option<crate::indirect::Window>> {
+        self.clamp_window.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// An occlusion query begun on the host in this list ([`crate::query::begin`]).
+    pub(crate) fn query_opened(&self, host: ID3D12QueryHeap, kind: u32, index: u32, console: usize) {
+        self.open_queries.lock().unwrap_or_else(|e| e.into_inner()).push((host, kind, index, console));
+    }
+
+    /// The query `index` of the console heap `console` was ended in this list ([`crate::query::end`]).
+    pub(crate) fn query_closed(&self, console: usize, index: u32) {
+        self.open_queries.lock().unwrap_or_else(|e| e.into_inner()).retain(|q| !(q.3 == console && q.2 == index));
+    }
+
     pub(crate) fn budget(&self) -> Option<u64> {
         let (buffer, data) = self
             .budget

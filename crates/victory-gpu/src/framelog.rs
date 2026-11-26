@@ -113,6 +113,75 @@ pub enum T {
     RemapNotesUs,
     RemapCuts,
     RemapCutBytes,
+    /// The remapping meter (`victory-hle` `xmem.rs`, `Meter`): the system's
+    /// unmapping and mapping calls counted (a remapping call of the title
+    /// makes none, one or many of each); the processor cycles the calling
+    /// thread used inside them and the processor's clock over the same
+    /// calls (their ratio is the share of the calls' time the thread was
+    /// on a processor: the rest it stood blocked in the kernel); and the
+    /// calls by length (under 50 us, to 200 us, to 1 ms, longer): how many
+    /// and their microseconds.
+    RemapUnmapCalls,
+    RemapUnmapCycles,
+    RemapUnmapTsc,
+    RemapUnmapC0,
+    RemapUnmapC1,
+    RemapUnmapC2,
+    RemapUnmapC3,
+    RemapUnmapU0,
+    RemapUnmapU1,
+    RemapUnmapU2,
+    RemapUnmapU3,
+    RemapMapCalls,
+    RemapMapCycles,
+    RemapMapTsc,
+    RemapMapC0,
+    RemapMapC1,
+    RemapMapC2,
+    RemapMapC3,
+    RemapMapU0,
+    RemapMapU1,
+    RemapMapU2,
+    RemapMapU3,
+    /// Mappings tried a second time after the placeholder was split
+    /// (`VICTORY_REMAP_SPLIT`); splits of a placeholder tried, those that
+    /// split one, and their microseconds.
+    RemapMapRetries,
+    RemapSplits,
+    RemapSplitsDone,
+    RemapSplitUs,
+    /// The queue's page-mapping copies as the runtime sees them
+    /// (`map_alias`): calls and their microseconds from entry to return
+    /// (the wait for the page table's lock included, which `RemapUs` leaves
+    /// out); pages mapped, those that were the next page of the same
+    /// section after the page mapped just before at the address just
+    /// before (one view could show both), and those that were the same
+    /// page as it (no view can).
+    RemapAliasCalls,
+    RemapAliasUs,
+    RemapAliasPages,
+    RemapAliasRunPages,
+    RemapAliasSamePages,
+    /// The title's own mapping calls (`XMemMapPhysicalPages`, and each page
+    /// of `XMemMapPhysicalPagesScatter`): calls, microseconds, pages.
+    RemapDirectCalls,
+    RemapDirectUs,
+    RemapDirectPages,
+    /// The queue's page-mapping copies as the title asks for them
+    /// (`queue.rs` `copy_page_mappings`): calls, and ranges and pages by
+    /// kind (0 pool pages in a row, 1 one pool page each, 2 unmapped).
+    PageMapCalls,
+    PageMapRanges0,
+    PageMapPages0,
+    PageMapRanges1,
+    PageMapPages1,
+    PageMapRanges2,
+    PageMapPages2,
+    /// Views of our own on physical pages for DirectStorage's writes
+    /// (`xmem.rs` `View`): how many, and the microseconds mapping,
+    /// committing and unmapping them.
+    DiskViews,
+    DiskViewUs,
     Count,
 }
 
@@ -417,7 +486,7 @@ fn text(f: &Frame) -> String {
     let ms = |x: T| f.t[x as usize] / 1e3;
     let s = |i: usize| f.s[i];
     let h = |x: H| f.h[x as usize];
-    format!(
+    let line = format!(
         "{:.0} ms | render thread: ran {:.0} ms (user {:.0}, kernel {:.0}); in the present call {:.1} (lines and settling \
          {:.1}, copy and show {:.1}), in submit calls {:.1}, in list calls {:.1}, paced {:.1} | submit thread: at work \
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
@@ -493,6 +562,69 @@ fn text(f: &Frame) -> String {
         t(T::WorkerLooks),
         t(T::RecordSlow),
         t(T::RecordLooks),
+    );
+    line + &remap_meter(f)
+}
+
+/// The remapping meter's part of a frame's line (the totals are described
+/// at [`T::RemapUnmapCalls`] and after it).
+fn remap_meter(f: &Frame) -> String {
+    let t = |x: T| f.t[x as usize];
+    let ms = |x: T| f.t[x as usize] / 1e3;
+    // The share of the calls' time their thread was on a processor. The
+    // cycles are read just outside the clock's two readings, so a short
+    // call can come out a little over the whole.
+    let on = |cycles: T, tsc: T| if t(tsc) > 0.0 { (100.0 * t(cycles) / t(tsc)).min(100.0) } else { 0.0 };
+    format!(
+        " | remapping, metered: {:.0} system unmaps (on a processor {:.0} % of their time; under 50 us {:.0} = {:.1} ms, \
+         to 200 us {:.0} = {:.1}, to 1 ms {:.0} = {:.1}, longer {:.0} = {:.1}), {:.0} system maps (on a processor {:.0} %; \
+         under 50 us {:.0} = {:.1} ms, to 200 us {:.0} = {:.1}, to 1 ms {:.0} = {:.1}, longer {:.0} = {:.1}; {:.0} tried again \
+         after a split); splits tried {:.0}, needed {:.0}, {:.1} ms; through the queue's page-mapping copies {:.0} calls \
+         {:.1} ms with the wait for the page table ({:.0} copies: {:.0} ranges {:.0} pages of pool pages in a row, {:.0} \
+         ranges {:.0} pages of one pool page each, {:.0} ranges {:.0} pages unmapped), {:.0} pages mapped, {:.0} the next \
+         page after the one before, {:.0} the same page as the one before; the title's own mapping calls {:.0}, {:.1} \
+         ms, {:.0} pages; views for disk writes {:.0}, {:.1} ms",
+        t(T::RemapUnmapCalls),
+        on(T::RemapUnmapCycles, T::RemapUnmapTsc),
+        t(T::RemapUnmapC0),
+        ms(T::RemapUnmapU0),
+        t(T::RemapUnmapC1),
+        ms(T::RemapUnmapU1),
+        t(T::RemapUnmapC2),
+        ms(T::RemapUnmapU2),
+        t(T::RemapUnmapC3),
+        ms(T::RemapUnmapU3),
+        t(T::RemapMapCalls),
+        on(T::RemapMapCycles, T::RemapMapTsc),
+        t(T::RemapMapC0),
+        ms(T::RemapMapU0),
+        t(T::RemapMapC1),
+        ms(T::RemapMapU1),
+        t(T::RemapMapC2),
+        ms(T::RemapMapU2),
+        t(T::RemapMapC3),
+        ms(T::RemapMapU3),
+        t(T::RemapMapRetries),
+        t(T::RemapSplits),
+        t(T::RemapSplitsDone),
+        ms(T::RemapSplitUs),
+        t(T::RemapAliasCalls),
+        ms(T::RemapAliasUs),
+        t(T::PageMapCalls),
+        t(T::PageMapRanges0),
+        t(T::PageMapPages0),
+        t(T::PageMapRanges1),
+        t(T::PageMapPages1),
+        t(T::PageMapRanges2),
+        t(T::PageMapPages2),
+        t(T::RemapAliasPages),
+        t(T::RemapAliasRunPages),
+        t(T::RemapAliasSamePages),
+        t(T::RemapDirectCalls),
+        ms(T::RemapDirectUs),
+        t(T::RemapDirectPages),
+        t(T::DiskViews),
+        ms(T::DiskViewUs),
     )
 }
 
