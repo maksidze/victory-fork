@@ -54,6 +54,14 @@ cbuffer Record : register(b0) {
     // Bit 4, with bit 2: the table's first word is the number of records
     // (a window, `windowed`: the CPU adds records while the list is
     // recorded), the offsets follow it.
+    // Bit 5, with bit 3 (`VICTORY_SPREAD_LEAN`, one group of at most 64
+    // records): plain [x, y, z] records, 12 bytes each, from byte 0, with
+    // the records that pass 65,535 groups in x left empty; then at
+    // `(records * 12 + 7) & ~7` a predicate word, 1 when any record that
+    // runs passes 65,535 and 0 otherwise; then 8 bytes on the
+    // [row, asked x, x, y, z] records, 20 bytes each, with only those
+    // records filled. The caller runs the plain records through the plain
+    // dispatch signature and the spread ones under the predicate.
     uint has_count;
     uint count_offset;
 };
@@ -79,6 +87,13 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+// Spread-eligible compute records over 65,535 groups in x and within it,
+// the groups past 65,535 asked in all, and (lean) whether any record that
+// runs is spread.
+groupshared uint spread_over;
+groupshared uint spread_under;
+groupshared uint spread_extra;
+groupshared uint spread_any;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -103,9 +118,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     uint dst_at = id.x * stride;
     bool spread = (has_count & 8u) != 0;
+    bool lean = spread && (has_count & 32u) != 0;
     uint row = 0;
     uint asked_x = 0;
-    if (spread) {
+    if (spread && !lean) {
         dst_at = id.x * 20u;
     }
     uint cost = 0;
@@ -115,6 +131,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
+        spread_over = 0;
+        spread_under = 0;
+        spread_extra = 0;
+        spread_any = 0;
     }
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -188,11 +208,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
     if (active && kind >= 2) {
         // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh or compute record asked for, and the
-        // groups asked in all.
+        // largest group count a mesh or compute record asked for, the
+        // groups asked in all, and of the spread-eligible compute records
+        // those spread (and their groups past 65,535) and the rest.
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+        if (spread) {
+            if (row != 0u) {
+                InterlockedAdd(spread_over, 1u, was);
+                InterlockedAdd(spread_extra, min(asked_x - 65535u, 1u << 24), was);
+            } else {
+                InterlockedAdd(spread_under, 1u, was);
+            }
+        }
     }
     // The group's own records: none for a group past a count buffer's
     // count (an execution may ask for thousands and count a few), which
@@ -232,15 +261,31 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
+    // (An active thread's lane is below `n`, so its `fits` slot is set.)
+    bool over = !active || fits[gi] == 0;
+    if (lean && !over && row != 0u) {
+        uint was;
+        InterlockedOr(spread_any, 1u, was);
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind >= 2 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
+        if (spread) {
+            budget.InterlockedAdd(12, spread_over, was);
+            budget.InterlockedAdd(16, spread_under, was);
+            budget.InterlockedAdd(20, spread_extra, was);
+        }
+    }
+    // Lean: the whole batch is this one group (the caller sees to that), so
+    // its first thread writes the predicate alone.
+    if (lean && gi == 0) {
+        dst_args.Store2((records * 12u + 7u) & ~7u, uint2(spread_any != 0u ? 1u : 0u, 0u));
     }
     if (!active) {
         return;
     }
-    bool over = fits[gi] == 0;
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -252,8 +297,18 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+            row = 0;
+            asked_x = 0;
         }
-        if (spread) {
+        if (lean) {
+            // Each record in both arrays, empty in the one it does not run
+            // from (an empty record dispatches nothing).
+            uint spread_at = ((records * 12u + 7u) & ~7u) + 8u + id.x * 20u;
+            bool spread_it = row != 0u;
+            dst_args.Store3(id.x * 12u, spread_it ? uint3(0u, 0u, 0u) : groups);
+            dst_args.Store2(spread_at, spread_it ? uint2(row, asked_x) : uint2(0u, 0u));
+            dst_args.Store3(spread_at + 8u, spread_it ? groups : uint3(0u, 0u, 0u));
+        } else if (spread) {
             dst_args.Store2(dst_at, uint2(row, asked_x));
             dst_args.Store3(dst_at + 8u, groups);
         } else {
@@ -398,7 +453,53 @@ pub(crate) fn bound(
     // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]).
     let bytes = if spread { bytes.max(20 * u64::from(spec.2)) } else { bytes };
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
+    let mode = if spread { SPREAD_CLASSIC } else { SPREAD_OFF };
+    clamp_into(list, c, &dst, budget, src, count, spec, false, mode).then_some(dst)
+}
+
+/// Spread modes of the clamp: none; every dispatch record written as
+/// [row, asked x, x, y, z] for the spread command signature; and lean
+/// ([`bound_lean`]).
+const SPREAD_OFF: u8 = 0;
+const SPREAD_CLASSIC: u8 = 1;
+const SPREAD_LEAN: u8 = 2;
+
+/// Most records a lean clamp takes: one group of the clamp, whose first
+/// thread alone writes the predicate word.
+pub(crate) const LEAN_RECORDS: u32 = 64;
+
+/// The scratch layout of a lean clamp of `records` dispatch records: the
+/// predicate word's offset, the spread records' offset, and the bytes in
+/// all. Plain [x, y, z] records, 12 bytes each, take the bytes before the
+/// predicate.
+pub(crate) fn lean_layout(records: u32) -> (u64, u64, u64) {
+    let n = u64::from(records.max(1));
+    let pred = (n * 12).next_multiple_of(8);
+    (pred, pred + 8, pred + 8 + n * 20)
+}
+
+/// [`bound`] for a spread dispatch, lean (`VICTORY_SPREAD_LEAN`): the
+/// records within 65,535 groups in x go to plain [x, y, z] records for the
+/// plain dispatch signature, the ones past it to [row, asked x, x, y, z]
+/// records for the spread signature, and a predicate word between says
+/// whether any record that runs is spread. Every record is in both arrays,
+/// empty in the one it does not run from. Returns the scratch buffer with
+/// the predicate's and the spread records' offsets; `None` for more than
+/// [`LEAN_RECORDS`] records (the caller takes [`bound`]'s spread then).
+pub(crate) fn bound_lean(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64, u64)> {
+    if spec.0 != 2 || spec.2 == 0 || spec.2 > LEAN_RECORDS {
+        return None;
+    }
+    end_window(list);
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (pred, spread_at, bytes) = lean_layout(spec.2);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, count, spec, false, SPREAD_LEAN).then_some((dst, pred, spread_at))
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -419,7 +520,7 @@ pub(crate) fn bound_ahead(
     end_window(list);
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, true, SPREAD_OFF).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -435,7 +536,7 @@ fn clamp_into(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
-    spread: bool,
+    spread: u8,
 ) -> bool {
     let before = list.indirect_state(dst);
     let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread, true);
@@ -461,12 +562,13 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, false, false)
+    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, SPREAD_OFF, false)
 }
 
-/// [`record_clamp_as`]; `spread`: dispatch records past 65,535 groups in x
-/// are spread across z, every record written as [row, asked x, x, y, z]
-/// (20 bytes) for `crate::draw`'s spread command signature.
+/// [`record_clamp_as`]; `spread`: [`SPREAD_CLASSIC`]: dispatch records past
+/// 65,535 groups in x are spread across z, every record written as
+/// [row, asked x, x, y, z] (20 bytes) for `crate::draw`'s spread command
+/// signature; [`SPREAD_LEAN`]: [`bound_lean`]'s layout.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_with(
     c: &Clamp,
@@ -477,7 +579,7 @@ fn record_clamp_with(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
-    spread: bool,
+    spread: u8,
     lean: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
@@ -528,7 +630,10 @@ fn record_clamp_with(
         stride,
         records,
         args_offset,
-        has_count | (u32::from(ahead) << 1) | (u32::from(spread && kind == 2) << 3),
+        has_count
+            | (u32::from(ahead) << 1)
+            | (u32::from(spread != SPREAD_OFF && kind == 2) << 3)
+            | (u32::from(spread == SPREAD_LEAN && kind == 2) << 5),
         count_offset,
     ];
     // SAFETY: an open list; our root signature and pipeline; live source,
@@ -586,7 +691,7 @@ fn record_clamp_with(
 
 /// Whether the clamp of a title's indirect command (`bound`, `bound_ahead`)
 /// ends with `dst`'s transition alone, without the wait for every earlier
-/// shader write that came with it (`VICTORY_CLAMP_LEAN=1`; off by default;
+/// shader write that came with it (`VICTORY_CLAMP_LEAN`; on by default, `0` off;
 /// `alt`: twenty seconds with, twenty without, in turn, each change said in
 /// the log). The first barrier, which orders the title's argument and count
 /// passes before the clamp reads them, stays as it is.
@@ -611,7 +716,8 @@ fn clamp_lean() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_CLAMP_LEAN").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -630,7 +736,7 @@ fn clamp_lean() -> bool {
     }
 }
 
-/// Whether indirect draws are clamped a window at a time (`VICTORY_CLAMP_WINDOW=1`; off by default; `alt`: twenty
+/// Whether indirect draws are clamped a window at a time (`VICTORY_CLAMP_WINDOW`; on by default, `0` off; `alt`: twenty
 /// seconds with, twenty without, in turn, each change said in the log). After Marvisak/VIctory #3197 (Slay326),
 /// ported onto this clamp: a window is one pass of the clamp's gather mode whose table the CPU fills while the
 /// list is recorded.
@@ -657,7 +763,8 @@ pub(crate) fn clamp_window() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_CLAMP_WINDOW").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -885,7 +992,10 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
 /// about 1,450 draws a frame each had a compute pass of ours in front of
 /// them: the card left drawing for compute and came back, about nine
 /// microseconds each (run 243, and the windows' own measurement).
-pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+///
+/// The third value: a segment's pass was recorded in the list for the record ([`gather_segments`]): the caller binds
+/// its own pipeline and root signature again.
+pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, spec: (u32, u32)) -> Option<(ID3D12Resource, u64, bool)> {
     end_window(list);
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
@@ -894,6 +1004,175 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
         return None;
     };
     list.gather_slot(src, src_id, offset, spec)
+}
+
+/// The records a segment's pass clamps at most ([`record_segment`]): one group of the clamp, one dispatch.
+pub(crate) const SEGMENT_PASS: u32 = 64;
+/// The passes a list records at most in one recording: its buffer of slots holds `SEGMENT_PASSES * SEGMENT_PASS`
+/// records of [`GATHER_STRIDE`] bytes (128 KiB).
+pub(crate) const SEGMENT_PASSES: u32 = 64;
+
+/// Whether a list that stopped gathering for its prelude ([`gather`]) gathers in segments (`VICTORY_GATHER_SEGMENTS=1`,
+/// with `VICTORY_INDIRECT_GATHER=1`; off by default; `alt`: twenty seconds with, twenty without, in turn, each change
+/// said in the log). After flipflop877/victory-nvidia-8gb-16fps c69bff19, ported onto this clamp's counted table
+/// (bit 16, as `windowed`).
+///
+/// A list stops gathering at the first command that may write arguments (`State::gather_ends`: a dispatch, a draw
+/// whose shaders may store, an indirect command that is not windowed): the prelude runs before the list, so it cannot
+/// clamp a record written inside it. Every record drawn after that had a pass of its own, between two waits for every
+/// earlier shader write. With the switch the stretch from one such command to the next is a segment: the first record
+/// of a segment (per argument buffer, kind and stride) records ONE pass in the list right there, after the command that
+/// may have written it, and the records drawn after it in the segment take slots that pass fills. The pass reads how
+/// many it has from its table's first word, which the CPU writes as records are taken and the card reads when the list
+/// runs.
+///
+/// Exact as a pass of its own per draw: the pass runs after every command recorded before it (the same full wait for
+/// shader writes first) and before the first draw that reads one of its slots, and nothing between it and those draws
+/// may write arguments: every `State::gather_ends` with stores (whole or by copy), every `HostList::gather_close` and
+/// `gather_wrote` ends all open segments ([`HostList::segments_end`]), and so do the list's close and reset. The rest
+/// of what is recorded between writes no buffer the records come from: our own clamps, windows and gathers write their
+/// scratch buffers; texture copies write textures; read-backs land in buffers of ours; the title's buffer copies and
+/// the host copies' refreshes run before the list (`card_before`), for the pass as for each single clamp. Each draw
+/// takes a slot of its own, so a record drawn twice is clamped and charged twice. The records charge the list's own
+/// budget word as their single clamps did, in draw order within a pass; what moves is that a pass charges its records
+/// when it runs, before passes of ours recorded between its draws: that shows only when the list's budget runs out
+/// (2^27 vertex instances or threads).
+/// The kind number of an indirect dispatch in gathered records.
+pub(crate) const DISPATCH_KIND: u32 = 2;
+
+/// Whether an open segment ([`gather_segments`]) outlives a dispatch
+/// (`VICTORY_SEGMENTS_ACROSS`; on unless `0`; `alt` in turn, twenty seconds
+/// each, said in the log): what a dispatch writes reaches later commands
+/// only after a barrier of the title's (D3D12's rule), so a dispatch marks
+/// the segment instead of ending it, and the title's next barrier or the
+/// next indirect draw ends it (`HostList::segments_dispatched`). Back-to-back
+/// tile dispatches with no barrier between them then share passes. (After
+/// avatarmanz/VIctory-7900XTX `VICTORY_INDIRECT_BATCH=2`.)
+pub(crate) fn segments_across() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SEGMENTS_ACROSS").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("open segments outlive dispatches until a barrier (VICTORY_SEGMENTS_ACROSS=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+pub(crate) fn gather_segments() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_SEGMENTS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        Ok("0") => 0,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("records after a list stops gathering are gathered in segments, a pass of ours per segment from now (VICTORY_GATHER_SEGMENTS=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// Whether an indirect dispatch's own record (one record, no count buffer, not spread) takes a slot of the prelude or
+/// of a segment as a draw's does, and the dispatch ends the gathering after that (`VICTORY_GATHER_DISPATCHES=1`, with
+/// `VICTORY_INDIRECT_GATHER=1`; off by default; `alt` as above). Its record is read before the dispatch runs, and
+/// nothing since the list's last command that may write arguments wrote it.
+pub(crate) fn gather_dispatches() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_DISPATCHES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        Ok("0") => 0,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!("indirect dispatches take gathered slots for their own record from now (VICTORY_GATHER_DISPATCHES=alt): {}", if on { "ON" } else { "off, as usual" });
+            }
+            on
+        }
+    }
+}
+
+/// Since the start, with [`gather_segments`]: records taken by segments' passes (each had a pass of its own before),
+/// the passes, the records that found no room (the list's passes all used, or no clamp or buffer) and were clamped
+/// alone, as before.
+pub(crate) static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Records, in `l`, a segment's pass ([`gather_segments`]): up to [`SEGMENT_PASS`] records of `kind` and `stride` from
+/// `src`, record `i` at the byte offset that word `i + 1` of the table at `table_gpu` names, as many as its word 0 says
+/// when the list runs; stored clamped at `at + i * stride` of `dst` (in state `before`), which is left in
+/// `INDIRECT_ARGUMENT`; charged to the budget word at `budget`. Waits for every earlier shader write first, as a single
+/// clamp does. Replaces the list's compute root signature and pipeline. False, with nothing recorded, if the layout or
+/// the addresses do not fit the clamp.
+pub(crate) fn record_segment(
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    at: u64,
+    budget: u64,
+    src: &ID3D12Resource,
+    table_gpu: u64,
+    (kind, stride): (u32, u32),
+) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    // SAFETY: live D3D12 buffer resources.
+    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + at) };
+    if gatherable(src_gpu, 0, (kind, stride)).is_none() || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || !table_gpu.is_multiple_of(4) {
+        return false;
+    }
+    // Bit 2: gathered from the table; bit 16: its first word is the count, the offsets follow.
+    let constants = [kind, stride, SEGMENT_PASS, 0u32, 4u32 | 16u32, 0u32];
+    let first = [uav_barrier(), transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+    let second = [
+        uav_barrier(),
+        transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    ];
+    let timed = crate::cardmeter::clamp_begin(l);
+    // SAFETY: an open list; our root signature and pipeline; live source, table (the list's upload memory), slot
+    // buffer and budget. Moving the slot buffer out of `INDIRECT_ARGUMENT` orders this pass after the reads of the
+    // slots earlier passes filled. Threads past the table's count return at once and charge nothing.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, table_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    crate::cardmeter::end(l, timed);
+    true
 }
 
 /// `VICTORY_GATHER_BY_COPY`: 0 off, 1 on, 2 in turn.
@@ -1818,7 +2097,7 @@ void main() {
             None,
             (KIND_DISPATCH, STRIDE, records.len() as u32),
             false,
-            true,
+            SPREAD_CLASSIC,
             false,
         ));
         // SAFETY: open command list; the clamp left `dst_buf` in `INDIRECT_ARGUMENT`.
@@ -1836,6 +2115,298 @@ void main() {
         assert_eq!(&out[0..5], &[57_600, 115_200, 57_600, 1, 2], "115,200 x 1 x 1: spread");
         assert_eq!(&out[5..10], &[0, 100, 100, 2, 1], "100 x 2 x 1: not spread");
         assert_eq!(&out[10..15], &[32_769, 65_537, 32_769, 1, 2], "65,537 x 1 x 1: spread");
+    }
+
+    #[test]
+    fn warp_spread_lean_routes_small_and_large_records_and_counts_them() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+
+        // Batch 1: mixed small + large + boundary 65,535.
+        let mixed: [[u32; 3]; 3] = [[100, 2, 1], [100_000, 1, 1], [65_535, 1, 1]];
+        let (pred_off, spread_off, total) = lean_layout(mixed.len() as u32);
+        assert_eq!((pred_off, spread_off), (40, 48));
+        let (src_buf, src_ptr, _) = warp.shared_buffer(4096);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(4096);
+        let dst_buf = warp.default_uav(4096);
+        // SAFETY: buffers mapped with the capacities above.
+        unsafe {
+            for (i, r) in mixed.iter().enumerate() {
+                for (w, v) in r.iter().enumerate() {
+                    (src_ptr as *mut u32).add(i * 3 + w).write_volatile(*v);
+                }
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 4096);
+        }
+        assert!(record_clamp_with(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DISPATCH, STRIDE, mixed.len() as u32),
+            false,
+            SPREAD_LEAN,
+            false,
+        ));
+        // SAFETY: open command list; clamp left `dst_buf` in `INDIRECT_ARGUMENT`.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total);
+        }
+        warp.submit_and_wait();
+        // SAFETY: GPU work complete; mapped host buffers.
+        let (out, budget_words) = unsafe {
+            (
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (total / 4) as usize).to_vec(),
+                std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 6).to_vec(),
+            )
+        };
+        assert_eq!(&out[0..3], &[100, 2, 1], "small record goes to plain");
+        assert_eq!(&out[3..6], &[0, 0, 0], "large record is zeroed in plain");
+        assert_eq!(&out[6..9], &[65_535, 1, 1], "65,535 boundary goes to plain");
+        assert_eq!(&out[10..12], &[1, 0], "predication word non-zero on mixed batch");
+        assert_eq!(&out[12..17], &[0, 0, 0, 0, 0], "small record is zeroed in spread");
+        assert_eq!(&out[17..22], &[50_000, 100_000, 50_000, 1, 2], "100k goes to spread");
+        assert_eq!(&out[22..27], &[0, 0, 0, 0, 0], "65,535 is zeroed in spread");
+        assert_eq!(budget_words[3], 1, "spread_over");
+        assert_eq!(budget_words[4], 2, "spread_under");
+        assert_eq!(budget_words[5], 34_465, "spread_extra");
+
+        // Batch 2: all-small batch resets `pred_off` to 0 even when reusing `dst_buf` cleanly.
+        let small: [[u32; 3]; 2] = [[100, 2, 1], [256, 1, 1]];
+        let (pred_off_s, _, total_s) = lean_layout(small.len() as u32);
+        assert_eq!(pred_off_s, 24);
+        // SAFETY: buffers mapped with the capacities above.
+        unsafe {
+            for (i, r) in small.iter().enumerate() {
+                for (w, v) in r.iter().enumerate() {
+                    (src_ptr as *mut u32).add(i * 3 + w).write_volatile(*v);
+                }
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, 4096);
+        }
+        assert!(record_clamp_with(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DISPATCH, STRIDE, small.len() as u32),
+            false,
+            SPREAD_LEAN,
+            false,
+        ));
+        // SAFETY: open command list.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_s);
+        }
+        warp.submit_and_wait();
+        // SAFETY: GPU work complete.
+        let (out_s, budget_s) = unsafe {
+            (
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (total_s / 4) as usize).to_vec(),
+                std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 6).to_vec(),
+            )
+        };
+        assert_eq!(&out_s[0..6], &[100, 2, 1, 256, 1, 1]);
+        assert_eq!(&out_s[6..8], &[0, 0], "predication word zeroed on all-small batch");
+        assert_eq!(budget_s[3], 0, "spread_over");
+        assert_eq!(budget_s[4], 2, "spread_under");
+        assert_eq!(budget_s[5], 0, "spread_extra");
+    }
+
+    #[test]
+    fn warp_spread_lean_executes_same_group_ids_as_spread_for_100k_groups() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const SHADER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
+cbuffer Spread : register(b0) { uint row; uint asked_x; };
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {
+    uint eff_x = row != 0 ? (gid.x + gid.z * row) : gid.x;
+    if (row != 0 && eff_x >= asked_x) return;
+    uint was;
+    out_buf.InterlockedMax(0, eff_x, was);
+    out_buf.InterlockedAdd(4, 1u, was);
+}
+"#;
+        let cs = crate::host::compile(SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        // SAFETY: WARP device and open command list in `WarpHarness`.
+        let (root, pso, plain_sig, spread_sig) = unsafe {
+            let root: ID3D12RootSignature = warp.device.CreateRootSignature(0, &cs[..]).unwrap();
+            let pso: ID3D12PipelineState = warp
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.as_ptr().cast(),
+                        BytecodeLength: cs.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let plain_arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            };
+            let mut plain_sig: Option<ID3D12CommandSignature> = None;
+            warp.device
+                .CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 12,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &plain_arg,
+                        NodeMask: 0,
+                    },
+                    None::<&ID3D12RootSignature>,
+                    &mut plain_sig,
+                )
+                .unwrap();
+            let spread_args = [
+                D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                        Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                            RootParameterIndex: 0,
+                            DestOffsetIn32BitValues: 0,
+                            Num32BitValuesToSet: 2,
+                        },
+                    },
+                },
+                D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                    ..Default::default()
+                },
+            ];
+            let mut spread_sig: Option<ID3D12CommandSignature> = None;
+            warp.device
+                .CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 20,
+                        NumArgumentDescs: 2,
+                        pArgumentDescs: spread_args.as_ptr(),
+                        NodeMask: 0,
+                    },
+                    Some(&root),
+                    &mut spread_sig,
+                )
+                .unwrap();
+            (root, pso, plain_sig.unwrap(), spread_sig.unwrap())
+        };
+
+        let (src_buf, src_ptr, _) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (zero_buf, zero_ptr, _) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(256);
+        let out_buf = warp.default_uav(256);
+        let dst_buf = warp.default_uav(256);
+        let (pred_off, spread_off, _) = lean_layout(1);
+
+        let mut run_case = |groups_x: u32, dst_initial: D3D12_RESOURCE_STATES| -> (u32, u32, u64) {
+            // SAFETY: mapped host buffers and open command list.
+            unsafe {
+                (src_ptr as *mut u32).write_volatile(groups_x);
+                (src_ptr as *mut u32).add(1).write_volatile(1);
+                (src_ptr as *mut u32).add(2).write_volatile(1);
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(zero_ptr, 0, 256);
+                std::ptr::write_bytes(readback_ptr, 0, 256);
+                warp.list.ResourceBarrier(&[transition(
+                    &out_buf,
+                    if dst_initial == D3D12_RESOURCE_STATE_COMMON {
+                        D3D12_RESOURCE_STATE_COMMON
+                    } else {
+                        D3D12_RESOURCE_STATE_COPY_SOURCE
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                warp.list.CopyBufferRegion(&out_buf, 0, &zero_buf, 0, 16);
+                warp.list.ResourceBarrier(&[transition(
+                    &out_buf,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            assert!(record_clamp_with(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, dst_initial),
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (2, 12, 1),
+                false,
+                SPREAD_LEAN,
+                false,
+            ));
+            // SAFETY: open command list; `dst_buf` is in `INDIRECT_ARGUMENT | PREDICATION`.
+            unsafe {
+                warp.list.SetComputeRootSignature(&root);
+                warp.list.SetPipelineState(&pso);
+                let zeros = [0u32, 0u32];
+                warp.list.SetComputeRoot32BitConstants(0, 2, zeros.as_ptr().cast(), 0);
+                warp.list.SetComputeRootUnorderedAccessView(1, out_buf.GetGPUVirtualAddress());
+                warp.list.ExecuteIndirect(&plain_sig, 1, &dst_buf, 0, None, 0);
+                warp.list
+                    .SetPredication(Some(&dst_buf), pred_off, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                warp.list
+                    .ExecuteIndirect(&spread_sig, 1, &dst_buf, spread_off, None, 0);
+                warp.list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                warp.list.ResourceBarrier(&[
+                    transition(
+                        &out_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                    transition(
+                        &dst_buf,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                ]);
+                warp.list.CopyBufferRegion(&readback_buf, 0, &out_buf, 0, 8);
+                warp.list.CopyBufferRegion(&readback_buf, 16, &dst_buf, pred_off, 8);
+            }
+            warp.submit_and_wait();
+            // SAFETY: GPU work complete; readback buffer mapped.
+            unsafe {
+                let p = readback_ptr.cast::<u32>().cast_const();
+                let pred = readback_ptr.add(16).cast::<u64>().cast_const().read_volatile();
+                (p.read_volatile(), p.add(1).read_volatile(), pred)
+            }
+        };
+
+        let (max_x_100k, ran_100k, pred_100k) = run_case(100_000, D3D12_RESOURCE_STATE_COMMON);
+        assert_eq!(max_x_100k, 99_999, "100k spread max eff_x");
+        assert_eq!(ran_100k, 100_000, "100k spread executed group count");
+        assert_ne!(pred_100k, 0, "100k sets predication non-zero");
+
+        let (max_x_100, ran_100, pred_100) = run_case(100, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        assert_eq!(max_x_100, 99, "100 plain max eff_x");
+        assert_eq!(ran_100, 100, "100 plain executed group count");
+        assert_eq!(pred_100, 0, "100 keeps predication zero");
     }
 
     /// WARP D3D12 execution test proving:

@@ -580,6 +580,56 @@ fn v_cmp_lg_is_false_for_nan() {
     }
 }
 
+/// Every f32 comparison (VOPC 0x000-0x00F: f, lt, eq, le, gt, lg, ge, o, u,
+/// nge, nlg, ngt, nle, neq, nlt, tru) gives the IEEE answer for NaNs,
+/// infinities and signed zeros. `o`, `u` and the `n` forms test NaN on the
+/// bits, so a driver that takes fast-math operands as never NaN cannot fold
+/// them away.
+#[test]
+fn every_f32_comparison_answers_nans_as_ieee() {
+    let nan = f32::NAN.to_bits();
+    let snan = 0x7F80_0001u32;
+    let f = f32::to_bits;
+    let values = [f(1.0), f(2.0), f(-0.0), f(0.0), f32::INFINITY.to_bits(), nan, snan];
+    let mut pairs = Vec::new();
+    for &a in &values {
+        for &b in &values {
+            pairs.push([a, b, 0, 0]);
+        }
+    }
+    let ieee = |op: u16, a: f32, b: f32| -> bool {
+        let un = a.is_nan() || b.is_nan();
+        match op {
+            0x0 => false,
+            0x1 => a < b,
+            0x2 => a == b,
+            0x3 => a <= b,
+            0x4 => a > b,
+            0x5 => a < b || a > b,
+            0x6 => a >= b,
+            0x7 => !un,
+            0x8 => un,
+            0x9 => !(a >= b),
+            0xA => !(a < b || a > b),
+            0xB => !(a > b),
+            0xC => !(a <= b),
+            0xD => !(a == b),
+            0xE => !(a < b),
+            _ => true,
+        }
+    };
+    for op in 0x000u16..=0x00F {
+        // v_cmp_<op>_f32_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &pairs, |backend, _, inp, got| {
+            let want = u32::from(ieee(op, f32::from_bits(inp[0]), f32::from_bits(inp[1])));
+            assert_eq!(got, want, "{backend}: v_cmp {op:#05x} ({:#010x}, {:#010x})", inp[0], inp[1]);
+        });
+    }
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)

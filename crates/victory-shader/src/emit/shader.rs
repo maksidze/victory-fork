@@ -12,6 +12,26 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload every translated mesh shader declares and never
+/// reads: 4 unless `VICTORY_MESH_LAUNCH=0` (none then, as before). With
+/// it the host puts an amplification shader of its own in front of the
+/// mesh shader (the launch of an indirect mesh record, `victory-gpu`'s
+/// `launch`), whose payload must have the size the mesh shader declares: a
+/// mesh shader that declares none is refused with one (the RTX 5080's
+/// driver returns `E_INVALIDARG`), and one that declares a payload is still
+/// taken without an amplification shader. Read here too so that the switch
+/// is part of the shader cache's key.
+pub fn mesh_payload_bytes() -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_none_or(|v| v != "0")) {
+        4
+    } else {
+        0
+    }
+}
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -78,6 +98,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// upstream VIctory pull request #2312, Xvania7; run 319 measured indirect
 /// compute records asking 115,200 groups, clamped to 65,535 before.)
 pub const USER_DISPATCH_SPREAD: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes, for a
+/// compute program with a spilled user-data table (the ray-tracing
+/// structure builder's stages): dword `n` the thread count along axis `n`
+/// of a `DispatchX` with `USE_THREAD_DIMENSIONS` (flags bit 5, 0x20) when
+/// it is not a whole number of groups, else 0 (every thread runs). The
+/// threads at or past the count do nothing, as the console leaves them out
+/// of EXEC. (After fork pull request #646, mynzjerko, which numbers it
+/// 0x104; that is [`USER_DISPATCH_SPREAD`] here, and 0x105 is fork #994's
+/// `USER_THREAD_LIMIT`.)
+pub const USER_DISPATCH_THREADS: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -166,6 +196,12 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Wide raw loads given a bounds check (`lower.rs`, `raw_dwords`).
+    #[cfg(test)]
+    pub guarded_wide_loads: u32,
+    /// Quad-local reads written through quad operations (`lower.rs`, `quad_read`).
+    #[cfg(test)]
+    pub quad_reads: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -222,6 +258,10 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            guarded_wide_loads: 0,
+            #[cfg(test)]
+            quad_reads: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -728,7 +768,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

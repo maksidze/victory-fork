@@ -73,8 +73,100 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    // The list this file reads for the translator (`translate_listed`): the
+    // shader crate's fingerprint does not see it.
+    h.update(b"VICTORY_WAVE_WIDE_ONLY=");
+    if let Some(value) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY") {
+        h.update(value.as_encoded_bytes());
+    }
+    h.update(b"\0VICTORY_WAVE_PAIRS_ONLY=");
+    if let Some(value) = std::env::var_os("VICTORY_WAVE_PAIRS_ONLY") {
+        h.update(value.as_encoded_bytes());
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
+}
+
+/// A container translated with the wave-wide form allowed when its hash is
+/// on `VICTORY_WAVE_WIDE_ONLY` (16-hex-digit hashes as the log names
+/// shaders, comma separated; unset or empty: none). Off by default: two
+/// programs that moved to that form were in a submission that lost the card
+/// (runs 121-124, not proven the cause). After commit a416e392 of pull
+/// request #823 (Felix2180), whose list is the four refused programs
+/// 5dc3b25986622949 and 6f225b641c5b0708 (the water's transmission
+/// volumetrics), 369cbe906ea72764 (particle visibility) and
+/// 2cc4c197ee29e291 (the reflection pass's tiling). For runs and the offline
+/// warm-up alike, which share the cache.
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty() && h != "none")
+            .collect()
+    });
+    let hash = blake3::hash(c).to_hex();
+    let wide = list.iter().any(|h| hash.starts_with(h.as_str()));
+    static PAIRS: OnceLock<Vec<String>> = OnceLock::new();
+    let pairs = PAIRS.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRS_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    let paired = listed_pair_hash(hash.as_str(), pairs);
+    if paired {
+        eprintln!("WAVE64-PAIRS-ONLY selected {}", &hash.as_str()[..16]);
+    }
+    victory_shader::emit::with_wave_wide(wide, || {
+        victory_shader::emit::with_wave_pairs(paired, || victory_shader::emit::translate(c))
+    }).map_err(|e| e.to_string())
+}
+
+fn listed_pair_hash(hash: &str, list: &[String]) -> bool {
+    hash.get(..16).is_some_and(|prefix| list.iter().any(|h| h == prefix))
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_hash_matches_only_complete_log_hashes() {
+    let list = vec!["5dc3b25986622949".to_owned(), "6f225b641c5b0708".to_owned()];
+    assert!(listed_pair_hash("5dc3b25986622949ffffffffffffffffffffffffffffffff", &list));
+    assert!(listed_pair_hash("6f225b641c5b0708", &list));
+    assert!(!listed_pair_hash("5dc3b25986622940", &list));
+    assert!(!listed_pair_hash("5dc3", &list));
+    assert!(!listed_pair_hash("5dc3b25986622949", &["5dc3".to_owned()]));
+}
+
+#[cfg(test)]
+#[test]
+fn listed_pair_cache_key_changes() {
+    const CHILD: &str = "VICTORY_CACHE_PAIRS_KEY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        println!("pairs-cache-key={}", blake3::Hash::from_bytes(build()));
+        return;
+    }
+    let key = |list: &str| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["listed_pair_cache_key_changes", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("VICTORY_WAVE_PAIRS", "0")
+            .env("VICTORY_WAVE_PAIRS_ONLY", list)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().lines()
+            .find_map(|line| line.split_once("pairs-cache-key=").map(|(_, key)| key.to_owned()))
+            .expect("the child printed its cache key")
+    };
+    let off = key("");
+    assert_ne!(off, key("5dc3b25986622949"));
+    assert_ne!(key("5dc3b25986622949"), key("6f225b641c5b0708"));
+    assert_eq!(off, key(""));
 }
 
 /// The offline warm-up (`victory translate --warm`): `container` is
@@ -86,7 +178,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate_listed(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
@@ -94,7 +186,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

@@ -51,8 +51,8 @@ pub(crate) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// One upload list holds at most this much texture memory, or this many
 /// milliseconds of work, so that its textures show soon.
-const LIST_BYTES: u64 = 48 << 20;
-const LIST_MS: u128 = 40;
+const LIST_BYTES: u64 = 128 << 20;
+const LIST_MS: u128 = 80;
 
 /// A view to give a host slot once its texture's upload is in the queue:
 /// the title's heap, the slot, the record's handle, and the record's key as

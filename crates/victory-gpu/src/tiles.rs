@@ -90,7 +90,9 @@ fn small_when_full_mb() -> u64 {
         std::env::var("VICTORY_TILES_SMALL_WHEN_FULL_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(0, |mb| mb.min(1024))
+            // 256 unless set (the run set gives 512): without it run 341
+            // showed 612 black textures.
+            .map_or(256, |mb| mb.min(1024))
     })
 }
 
@@ -1682,8 +1684,16 @@ void look() {
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;
         let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
-        assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
-        assert_eq!(tiled.given_bytes(), 0);
+        if small_when_full_mb() == 0 {
+            assert!(!changed && waiting);
+            assert_eq!(tiled.given_bytes(), 0);
+        } else {
+            // On by default (512 MB): the held small level 1 gets its tile
+            // on the full card, level 0 still none.
+            assert!(tiled.has_tiles(1));
+            assert_eq!(tiled.given_bytes(), TILE);
+            let _ = (changed, waiting);
+        }
     }
 }

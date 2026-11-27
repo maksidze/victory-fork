@@ -349,11 +349,15 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// object `out` names and draws with it. They are the console's
+/// pipelines from precompiled binaries (code and metadata per stage, the
+/// title's root signature, a register image), called in one burst while
+/// loading: a cache. On failure the title makes the same pipeline later the
+/// usual way (`create_stream`), so nothing goes missing (run 335: every call
+/// in the first 36 s, then 727 mesh and 1,016 pixel pipelines made normally;
+/// upstream VIctory #3163 says the same, and that answering them made things
+/// worse there). The calls fail as they always did, with `out` null, and the
+/// first ones log what the description holds.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(

@@ -113,9 +113,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    LAUNCH_SPACE, mesh_payload_bytes, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -214,6 +214,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(wave_pairs_on()));
     out
 }
 
@@ -226,7 +227,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::DEFAULT, |n| n & (bitcode::opt::ALL | bitcode::opt::FAST))
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -372,6 +373,49 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// [`with_wave_wide`]'s choice, for this thread's translations.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WAVE_PAIRS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form of a wave64 compute
+/// program on a host of 32-lane waves allowed, as `VICTORY_WAVE_WIDE=1`
+/// allows it for all, for one program chosen by its hash
+/// (`victory-gpu`'s `VICTORY_WAVE_WIDE_ONLY`). The form is still tried only
+/// after the exact ones. (After commit a416e392 of pull request #823 by
+/// Felix2180: the water's transmission volumetrics, particle visibility and
+/// the reflection pass's tiling come out of it with 32-lane waves.)
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.replace(on);
+    let out = f();
+    WAVE_WIDE_HERE.set(before);
+    out
+}
+
+pub fn with_wave_pairs<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WAVE_PAIRS_HERE.set(self.0);
+        }
+    }
+    let _restore = Restore(WAVE_PAIRS_HERE.replace(on));
+    f()
+}
+
+#[cfg(test)]
+#[test]
+fn listed_wave_pairs_scope_is_restored() {
+    assert!(!WAVE_PAIRS_HERE.get());
+    with_wave_pairs(true, || {
+        assert!(WAVE_PAIRS_HERE.get());
+        with_wave_pairs(false, || assert!(!WAVE_PAIRS_HERE.get()));
+        assert!(WAVE_PAIRS_HERE.get());
+    });
+    assert!(!WAVE_PAIRS_HERE.get());
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -383,6 +427,20 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    let wave32_compute =
+        native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32;
+    let listed = WAVE_PAIRS_HERE.get();
+    if listed && wave32_compute {
+        match paired(c, native, p) {
+            Ok((shader, Some(32))) => {
+                eprintln!("WAVE64-PAIRS-ONLY translated with paired Wave64");
+                return Ok(shader);
+            }
+            Ok((_, wave)) => eprintln!("WAVE64-PAIRS-ONLY unexpected wave {wave:?}; falling back"),
+            Err(e) => eprintln!("WAVE64-PAIRS-ONLY refused: {e}; falling back"),
+        }
+        lower::take_needs();
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -394,10 +452,29 @@ pub fn emit(
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
         Err(_) => false,
     };
+    let pairs_on = wave_pairs_on() && !listed;
+    if wave32_compute
+        && pairs_on
+        && !stuck
+        && (matches!(native.io, crate::native::StageIo::Cs(cs) if cs.lds_bytes() > 0)
+            || lower::crosses_halves(p, st)
+                && (original.is_err() || lower::wave_local(p, st).is_err()))
+    {
+        let again = paired(c, native, p);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &again {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired Wave64: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired Wave64: {e}"),
+            }
+        }
+        if let Ok((shader, Some(32))) = again {
+            return Ok(shader);
+        }
+    }
     // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
-    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+    if stuck && wave32_compute {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -482,7 +559,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
         // `VICTORY_WAVE_WIDE=last`: the same form, but only for programs that every other
         // form below leaves at 64 lanes (on a 32-lane host those are refused outright), so
         // the programs the approximate forms already take keep their barrier-free form.
@@ -491,6 +568,13 @@ pub fn emit(
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
             if !exact {
+                if pairs_on {
+                    let again = paired(c, native, p);
+                    report("paired Wave64", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Before anything approximate, the exact forms that cost group barriers.
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
@@ -668,7 +752,7 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        let more: Vec<usize> = lower::branches_around_with_loop_exits(&st, &needs, native.wave64 && lower::host_max_wave() == 32 && lower::loop_exits_on())
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))
@@ -681,6 +765,95 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+fn wave_pairs_on() -> bool {
+    std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
+}
+
+// Paired lanes from PR #854 (PiloteCode), including the per-wave CFG used by 840243e2.
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes outside compute",
+        });
+    };
+    // `VICTORY_WAVE_PAIRS_SPILLED=1`: try it anyway (the structure builder's
+    // three wave64 programs are spilled ones; offline checks first).
+    if crate::spill::is_spilled(native)
+        && std::env::var_os("VICTORY_WAVE_PAIRS_SPILLED").is_none_or(|v| v != "1")
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 for spilled DispatchX programs is not validated",
+        });
+    }
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || threads % 64 != 0 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 requires a single-entry wave prologue",
+        });
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 exceeds the compute group shared-memory limit",
+        });
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    if accesses_lds
+        && (lds == 0 || insts().filter(|i| lower::accesses_lds(i)).any(|i| {
+            !lower::supports_paired_lds(i.name())
+        }))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "an LDS operation not supported by paired Wave64",
+        });
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // Independently progressing waves cannot rendezvous after a divergent exit.
+    if (threads > 64 && p.blocks.len() > 1 && waits)
+        || (group_sync() == 0 && (threads > 64 || waits))
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "paired Wave64 would require an unavailable group rendezvous",
+        });
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -888,13 +1061,15 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(usual, 127 | super::bitcode::opt::FAST, "every pass, the wide loads and the fast-math flag too");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        let fast = super::bitcode::opt::FAST;
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all | fast);
+        assert_eq!(parse_shader_opt(Some("255")), all | fast);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
 
@@ -973,6 +1148,138 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// Quad-local reads in a pixel shader go through quad reads, which see
+    /// the quad's helper lanes (wave reads do not): a swap across x (DPP
+    /// `quad_perm:[1,0,3,2]`) and across y (`ds_swizzle` quad mode
+    /// `[2,3,0,1]`) as one quad operation each, any other pattern
+    /// (`[0,0,3,1]`) through the four quad reads. Validated where dxil.dll is.
+    #[test]
+    fn a_pixel_quads_lanes_are_read_through_quad_reads() {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0x7E02_02FA,
+            0xFF00_B100, // v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2]
+            0xD8D4_804E,
+            0x0200_0000, // ds_swizzle_b32 v2, v0 offset:swizzle(QUAD_PERM,2,3,0,1)
+            0x7E06_02FA,
+            0xFF00_7000, // v_mov_b32_dpp v3, v0 quad_perm:[0,0,3,1]
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF800_180F,
+            0x0003_0201, // exp mrt0 v1, v2, v3, v0 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(l.quad_reads, 3, "each quad-local read of the pixel shader is a quad read");
+        assert!(l.wave_ops);
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    /// A pixel shader's `v_readfirstlane_b32` gives a helper lane its own
+    /// value (`isHelperLane`, SM 6.6): a waterfall loop left with helper
+    /// lanes only then ends instead of running to the loop limit. Lowered and
+    /// validated where dxil.dll is.
+    #[test]
+    fn a_pixel_first_lane_read_gives_a_helper_lane_its_own_value() {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0x7E00_0500,    // v_readfirstlane_b32 s0, v0
+            0x7E02_0200,    // v_mov_b32 v1, s0
+            0xF800_180F,
+            0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1351,10 +1658,27 @@ mod tests {
     /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
     /// call's four dwords lie across the view's end (the dwords out of it
     /// are 0, the others are read). On the software adapter only: run the
-    /// test once plain and once with `VICTORY_SHADER_OPT=127`.
+    /// test once plain and once with `VICTORY_SHADER_OPT=63`. With the wide
+    /// calls it runs twice: once as written, once as a card that zeroes a
+    /// whole call that crosses the view's end would run it
+    /// (`lower::WHOLE_CALL_ZEROS`); the bounds check of `raw_dwords` gives
+    /// the console's dwords on both.
     #[test]
     #[cfg(windows)]
     fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {
+        let wide = shader_opt() & super::bitcode::opt::WIDE != 0;
+        for whole in if wide { &[false, true][..] } else { &[false][..] } {
+            super::lower::WHOLE_CALL_ZEROS.set(*whole);
+            let r = std::panic::catch_unwind(|| scalar_buffer_loads_case(*whole));
+            super::lower::WHOLE_CALL_ZEROS.set(false);
+            if let Err(e) = r {
+                std::panic::resume_unwind(e);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn scalar_buffer_loads_case(whole: bool) {
         // (first register, dwords) of the three loads, in order.
         const LOADS: [(u32, u32); 3] = [(16, 8), (24, 4), (32, 16)];
         let mut words: Vec<u32> = vec![
@@ -1439,6 +1763,9 @@ mod tests {
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
         let wide = shader_opt() & super::bitcode::opt::WIDE != 0;
+        // A table's SRV is bounded: each wide call checks it lies inside
+        // the view and falls back to a call a dword where it does not.
+        assert_eq!(l.guarded_wide_loads, if wide { 7 } else { 0 }, "every wide call on the table's view is checked");
         let mut dxil = l.dxil;
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1492,8 +1819,8 @@ mod tests {
             for (&(_, n), start) in LOADS.iter().zip(starts) {
                 want.extend((0..u64::from(n)).map(|k| dword(start + 4 * k)));
             }
-            eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
-            assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+            eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}, whole calls zeroed: {whole}: {:x?}", &out[0][..28]);
+            assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}, whole calls zeroed: {whole}");
         }
     }
 

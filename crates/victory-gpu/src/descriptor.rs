@@ -518,15 +518,18 @@ fn changed_slots(
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap is still there, and `id` says it is the one that
+/// took them ([crate::descriptor::host::HostHeap::id]): the title can release
+/// the heap a list's slots came from, and a later heap can be made at the
+/// same address before the list is reset.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -536,6 +539,13 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        // Its run of title-memory views goes with it: a heap made later at
+        // the same address must not find this one's run (fork pull request
+        // #589, AscilCH).
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -1490,6 +1500,36 @@ mod tests {
         );
     }
 
+    /// A released view heap takes its run of title-memory views with it
+    /// (`memory::forget_heap`): a heap made later at the same address starts
+    /// its own run. (Fork pull request #589's test, on our helpers.)
+    #[cfg(windows)]
+    #[test]
+    fn a_released_view_heap_forgets_its_title_memory_run() {
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let host_heap = heap(h).host().expect("a host view heap");
+        let key = std::ptr::from_ref(host_heap) as usize;
+        assert!(crate::memory::ready(&list, host_heap, &[], &[], false).is_some());
+        assert!(crate::memory::has_run(key), "the heap's run is kept while it lives");
+        assert_eq!(object::release_boxed::<Heap>(h), 0);
+        assert!(!crate::memory::has_run(key), "a released heap's run is forgotten");
+    }
+
     /// A table made afresh for a draw holds the descriptors its shader
     /// moves halves through (`HostShader::half_views`), also past the range
     /// starts its used-resource entries give: with one entry for a range
@@ -1548,7 +1588,7 @@ mod tests {
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1);
+        host_heap.release(host_heap.id(), next, 1);
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(

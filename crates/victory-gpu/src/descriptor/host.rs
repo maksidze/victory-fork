@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -18,6 +19,11 @@ use crate::host::host;
 /// behind different locks on purpose: the recording threads take their
 /// tables' dynamic slots from one ring, next to one another.
 const KEPT_PIECES: u32 = 64;
+
+/// Each host heap's identity, handed out in order: a range of dynamic slots
+/// is given back to the heap that took it, and a heap made later at the same
+/// address is not that heap ([`HostHeap::release`]).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Whether the recording threads are spared the heap's two busiest locks
 /// (`VICTORY_HEAP_LOCKS=1`; after fork pull request #1146, part 1; OFF
@@ -42,7 +48,8 @@ fn heap_locks() -> bool {
     match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_LOCKS").as_deref() {
         Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        Ok("0") => 0,
+        _ => 1,
     }) {
         0 => false,
         1 => true,
@@ -146,6 +153,8 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release`]).
+    id: u64,
 }
 
 /// Diagnostics, since the last line (`crate::draw::tables_line`): the host
@@ -1163,6 +1172,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1354,6 +1364,12 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back only
+    /// to it, never to a heap made later at the same address.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -2029,10 +2045,16 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if they were taken by this heap: `id` is [`HostHeap::id`]'s.
+    /// The title can release the heap a list's slots came from, and a later
+    /// heap can be made at the same address; the list's reset then names the
+    /// old heap, and must not free the new one's slots ([NEXT_ID]).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -2422,6 +2444,15 @@ impl HostHeap {
         // Made from this record already ([`heap_locks`]): what the lock
         // would find, without it. (The view is looked up first, as under
         // the lock: a record whose view is gone is not served here.)
+        if !for_draw
+            && tag != VIEW_TAG
+            && heap_locks()
+            && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == 0
+        {
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_NOT_VIEW);
+            return None;
+        }
         if tag == VIEW_TAG
             && heap_locks()
             && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
@@ -3986,6 +4017,37 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A range of dynamic slots is given back only to the heap that took it:
+    /// the title can release a heap while a list still holds slots of it,
+    /// and a later heap can be made at the same address before that list is
+    /// reset.
+    #[cfg(windows)]
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(
+            a.free.load(Relaxed),
+            free,
+            "another heap's identity gave the range back"
+        );
+        a.release(a.id(), first, 2);
+        assert_eq!(
+            a.free.load(Relaxed),
+            free + 2,
+            "their own heap did not get the range back"
+        );
+    }
+
     /// A constant view is made in 256-byte steps and at most 64 KiB, the
     /// most the host takes (a larger size removes the device on NVIDIA).
     #[test]
@@ -4802,11 +4864,11 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.dynamic(rest), Some(4 + 16));
         // The search starts at 0 again. Slots 0..16 back, then 0..12 taken:
         // it starts at 12, with 12..16 free.
-        heap.release(4, 16);
+        heap.release(heap.id(), 4, 16);
         assert_eq!(heap.dynamic(12), Some(4));
         // 10..12 back: the free run 10..16 lies across 12. Six slots fit
         // only there.
-        heap.release(4 + 10, 2);
+        heap.release(heap.id(), 4 + 10, 2);
         assert_eq!(heap.dynamic(6), Some(4 + 10));
         // And nothing is found where nothing is.
         assert_eq!(heap.dynamic(1), None);
@@ -4822,7 +4884,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
